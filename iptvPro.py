@@ -17,17 +17,24 @@ import threading
 from queue import Queue
 import asyncio
 from playwright.async_api import async_playwright
+import argparse
 
-semaphore = asyncio.Semaphore(3)
+max_thread = 7
+parser = argparse.ArgumentParser(description="sniff iptv with some custom settings")
+parser.add_argument("-m", '--max_thread', default=max_thread, type=str, help=f"thread,default is {max_thread}")
+args = parser.parse_args()
+print('max_thread:', args.max_thread)
+semaphore = asyncio.Semaphore(int(args.max_thread))
 
 import eventlet
 
 eventlet.monkey_patch()
 
 today = datetime.now()
+user_agent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.50 Safari/537.36'
 formatted_date = today.strftime('%Y年%m月%d日')[2:]
-
-config_path = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), './quart_config.json'))).as_posix()
+base_dir = os.path.dirname(__file__)
+config_path = Path(os.path.abspath(os.path.join(base_dir, './quart_config.json'))).as_posix()
 print(config_path)
 if not os.path.exists(config_path):
     exit(f"config_path not found for {config_path}")
@@ -35,7 +42,7 @@ if not os.path.exists(config_path):
 with open(config_path, encoding='utf-8') as f:
     config_dict = json.loads(f.read())
 print(config_dict)
-save_path = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), './static/lives'))).as_posix()
+save_path = Path(os.path.abspath(os.path.join(base_dir, './static/lives'))).as_posix()
 if not os.path.exists(save_path):
     os.makedirs(save_path, exist_ok=True)
 print('save_path:', save_path)
@@ -133,6 +140,65 @@ async def _on_crash(*args):
     # await page.close()  # 关闭页面或采取其他措施
 
 
+async def _route_interceptor(route):
+    """
+    全局路由拦截器,禁止加载某些资源
+    @param route:
+    @return:
+    """
+    excluded_resource_types = ["stylesheet", "image", "font"]
+    resource_type = route.request.resource_type
+    # print(resource_type)
+    if resource_type in excluded_resource_types:
+        # print('禁止加载资源:', excluded_resource_types, route.request.url, route.request.resource_type)
+        await route.abort()
+    else:
+        await route.continue_()
+
+
+async def _get_page(page, timeout=10000, headers=None):
+    """
+    新建一个页面。注入好相关依赖
+    @param headers:
+    @return:
+    """
+    # 设置全局导航超时
+    page.set_default_navigation_timeout(timeout)
+    # 设置全局等待超时
+    page.set_default_timeout(timeout)
+
+    await page.expose_function("log", lambda *args: print(*args))
+    js = """
+    Object.defineProperties(navigator, {webdriver: {get: () => undefined}});
+    Object.defineProperties(navigator, {platform: {get: () => 'iPhone'}});
+        """
+    await page.add_init_script(js)
+
+    # 添加初始化脚本 提高速度并且过无法播放的验证
+    await page.add_init_script(path=os.path.join(base_dir, './sniffer/stealth.min.js'))
+    await page.add_init_script(path=os.path.join(base_dir, './sniffer/devtools.js'))
+    await page.add_init_script(path=os.path.join(base_dir, './sniffer/navigator.js'))
+    # 屏蔽控制台监听器 https://cdn.staticfile.net/devtools-detector/2.0.14/devtools-detector.min.js
+    await page.route(re.compile(r"devtools-detector.*\.js$"), lambda route: route.abort())
+    # 设置请求头
+    if headers is not None:
+        await page.set_extra_http_headers(headers=headers)
+    else:
+        await page.set_extra_http_headers(headers={'user-agent': user_agent})
+
+    # 打开静态资源拦截器
+    # await page.route(re.compile(r"\.(png|jpg|jpeg|css|ttf)$"), self._route_interceptor)
+    await page.route(re.compile(r"\.(png|jpg|jpeg|ttf)$"), _route_interceptor)
+    await page.route(re.compile(r".*google\.com.*"), lambda route: route.abort())
+    # 打开弹窗拦截器
+    page.on("dialog", _on_dialog)
+    # 打开页面错误监听
+    page.on("pageerror", _on_pageerror)
+    # 打开页面崩溃监听
+    page.on("crash", _on_crash)
+    return page
+
+
 # 异步获取页面源码
 async def get_page_source(url, timeout, channel, headless):
     async with semaphore:  # 在任务开始前获取信号量
@@ -141,13 +207,7 @@ async def get_page_source(url, timeout, channel, headless):
             browser = await p.chromium.launch(channel=channel, headless=headless)  # 启动浏览器
             context = await browser.new_context()  # 创建新的浏览器上下文
             page = await context.new_page()  # 创建新页面
-            # 打开弹窗拦截器
-            page.on("dialog", _on_dialog)
-            # 打开页面错误监听
-            page.on("pageerror", _on_pageerror)
-            # 打开页面崩溃监听
-            page.on("crash", _on_crash)
-
+            # page = await _get_page(page)
             print('goto:', url)
             try:
                 await page.goto(url)  # 打开指定网址
@@ -442,11 +502,11 @@ def main():
                     if channel_counters[channel_name] >= result_counter:
                         continue
                     else:
-                        file.write(f"#EXTINF:-1 group-title=\"央视频道\",{channel_name}\n")
+                        file.write(f"#EXTINF:-1 group-title=\"🌏｜央视频道\",{channel_name}\n")
                         file.write(f"{channel_url}\n")
                         channel_counters[channel_name] += 1
                 else:
-                    file.write(f"#EXTINF:-1 group-title=\"央视频道\",{channel_name}\n")
+                    file.write(f"#EXTINF:-1 group-title=\"🌏｜央视频道\",{channel_name}\n")
                     file.write(f"{channel_url}\n")
                     channel_counters[channel_name] = 1
         channel_counters = {}
@@ -458,11 +518,11 @@ def main():
                     if channel_counters[channel_name] >= result_counter:
                         continue
                     else:
-                        file.write(f"#EXTINF:-1 group-title=\"卫视频道\",{channel_name}\n")
+                        file.write(f"#EXTINF:-1 group-title=\"🛰｜卫视频道\",{channel_name}\n")
                         file.write(f"{channel_url}\n")
                         channel_counters[channel_name] += 1
                 else:
-                    file.write(f"#EXTINF:-1 group-title=\"卫视频道\",{channel_name}\n")
+                    file.write(f"#EXTINF:-1 group-title=\"🛰｜卫视频道\",{channel_name}\n")
                     file.write(f"{channel_url}\n")
                     channel_counters[channel_name] = 1
         channel_counters = {}
@@ -474,15 +534,16 @@ def main():
                     if channel_counters[channel_name] >= result_counter:
                         continue
                     else:
-                        file.write(f"#EXTINF:-1 group-title=\"其他频道\",{channel_name}\n")
+                        file.write(f"#EXTINF:-1 group-title=\"👑｜其他频道\",{channel_name}\n")
                         file.write(f"{channel_url}\n")
                         channel_counters[channel_name] += 1
                 else:
-                    file.write(f"#EXTINF:-1 group-title=\"其他频道\",{channel_name}\n")
+                    file.write(f"#EXTINF:-1 group-title=\"👑｜其他频道\",{channel_name}\n")
                     file.write(f"{channel_url}\n")
                     channel_counters[channel_name] = 1
 
         file.write(f"#EXTINF:-1 group-title=\"📺｜定期维护\",{formatted_date}更新\n")
+        file.write(f"{first_channel_url}\n")
 
     t2 = time.time()
     print(f'共计耗时:{round(t2 - t1, 2)}秒')
